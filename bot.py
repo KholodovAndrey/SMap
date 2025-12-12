@@ -4,13 +4,16 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
+import hashlib
+import shutil
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, InlineKeyboardButton, InlineKeyboardMarkup,
-    CallbackQuery
+    CallbackQuery, BufferedInputFile, FSInputFile
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -43,9 +46,30 @@ logger = logging.getLogger(__name__)
 # Файлы для хранения данных
 LOCATIONS_FILE = "data/locations.json"
 FEEDBACKS_FILE = "data/feedbacks.json"
+COORDINATES_FILE = "data/map_coordinates.json"
 
-# Создаем директорию для данных, если её нет
+# Папки для карт
+MAP_IMAGE = "images/school_map.png"
+MAP_CACHE_DIR = "images/cache/"
+GENERATED_MAPS_DIR = "images/generated/"
+
+# Время кэширования карты в секундах (5 минут)
+MAP_CACHE_TIME = 300
+
+# Шрифты для карты (пробуем разные варианты)
+FONT_PATHS = [
+    "arial.ttf",
+    "arialbd.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc"
+]
+
+# Создаем директории для данных, если их нет
 os.makedirs("data", exist_ok=True)
+os.makedirs(MAP_CACHE_DIR, exist_ok=True)
+os.makedirs(GENERATED_MAPS_DIR, exist_ok=True)
 
 # Инициализация бота с правильными параметрами для aiogram 3.7+
 bot = Bot(
@@ -99,7 +123,9 @@ def get_locations() -> List[Dict]:
         {"id": 7, "name": "Раздевалки", "emoji": "🚿", "description": "Раздевалки и душевые"},
         {"id": 8, "name": "Кабинеты химии/физики", "emoji": "🧪", "description": "Специализированные кабинеты"},
         {"id": 9, "name": "Актовый зал", "emoji": "🎭", "description": "Зал для мероприятий"},
-        {"id": 10, "name": "Коридоры и рекреации", "emoji": "🚪", "description": "Общие помещения"}
+        {"id": 10, "name": "Коридоры и рекреации", "emoji": "🚪", "description": "Общие помещения"},
+        {"id": 11, "name": "Турникеты", "emoji": "🎫", "description": "Входные турникеты и система контроля доступа"},
+        {"id": 12, "name": "Бассейн", "emoji": "🏊", "description": "Школьный бассейн и раздевалки при нем"}
     ])
 
 def get_feedbacks() -> List[Dict]:
@@ -111,8 +137,7 @@ def save_feedback(feedback_type: str, location_id: int, text: str, user_id: Opti
     try:
         feedbacks = get_feedbacks()
         
-        # Генерируем анонимный ID для пользователя (только для публичного просмотра)
-        # В реальных данных сохраняем настоящий user_id для администраторов
+        # Генерируем анонимный ID для пользователя (только для публичный просмотра)
         public_user_id = f"user_{len(feedbacks) + 1000}"
         
         new_feedback = {
@@ -122,10 +147,8 @@ def save_feedback(feedback_type: str, location_id: int, text: str, user_id: Opti
             "type_text": "Жалоба" if feedback_type == "complaint" else "Предложение",
             "location_id": location_id,
             "text": text,
-            # Для администраторов сохраняем реальные данные
             "real_user_id": user_id,
             "real_username": username,
-            # Для публичного просмотра - анонимные данные
             "public_user_id": public_user_id,
             "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
             "timestamp": datetime.now().isoformat(),
@@ -135,6 +158,10 @@ def save_feedback(feedback_type: str, location_id: int, text: str, user_id: Opti
         feedbacks.append(new_feedback)
         save_json(FEEDBACKS_FILE, feedbacks)
         logger.info(f"Сохранено обращение #{new_feedback['id']} от пользователя {user_id} ({username})")
+        
+        # ОЧИЩАЕМ КЭШ КАРТЫ при сохранении нового обращения
+        cleanup_cache_completely()
+        
     except Exception as e:
         logger.error(f"Ошибка при сохранении обращения: {e}")
 
@@ -173,15 +200,486 @@ def get_location_full_info(location_id: int) -> Dict:
 
 def anonymize_text(text: str, max_length: int = 200) -> str:
     """Анонимизировать текст, убирая возможные личные данные"""
-    # Убираем упоминания пользователей (@username)
     import re
     text = re.sub(r'@\w+', '[пользователь]', text)
-    # Убираем ссылки
     text = re.sub(r'https?://\S+', '[ссылка]', text)
-    # Обрезаем если слишком длинный
     if len(text) > max_length:
         text = text[:max_length] + "..."
     return text
+
+# ==================== УТИЛИТЫ ДЛЯ РАБОТЫ С КАРТОЙ ====================
+def load_coordinates() -> Dict:
+    """Загрузить координаты для карты"""
+    default_coordinates = {
+        "1": {"x": 400, "y": 300, "name": "Главный корпус"},
+        "2": {"x": 200, "y": 200, "name": "Столовая"},
+        "3": {"x": 600, "y": 200, "name": "Спортзал"},
+        "4": {"x": 150, "y": 400, "name": "Библиотека"},
+        "5": {"x": 650, "y": 400, "name": "Компьютерный класс"},
+        "6": {"x": 400, "y": 100, "name": "Школьный двор"},
+        "7": {"x": 700, "y": 300, "name": "Раздевалки"},
+        "8": {"x": 300, "y": 500, "name": "Кабинеты химии/физики"},
+        "9": {"x": 500, "y": 500, "name": "Актовый зал"},
+        "10": {"x": 400, "y": 400, "name": "Коридоры"},
+        "11": {"x": 100, "y": 300, "name": "Турникеты"},
+        "12": {"x": 600, "y": 100, "name": "Бассейн"}
+    }
+    
+    if not os.path.exists(COORDINATES_FILE):
+        save_json(COORDINATES_FILE, default_coordinates)
+        logger.info(f"Создан файл с координатами: {COORDINATES_FILE}")
+        return default_coordinates
+    
+    coordinates = load_json(COORDINATES_FILE, default_coordinates)
+    
+    # Проверяем, есть ли все локации в координатах
+    locations = get_locations()
+    for loc in locations:
+        loc_id_str = str(loc["id"])
+        if loc_id_str not in coordinates:
+            # Если локации нет в координатах, создаем ее в центре карты (предполагаем карту 1024x1024)
+            coordinates[loc_id_str] = {
+                "x": 512,  # Центр по X
+                "y": 512,  # Центр по Y
+                "name": loc["name"]
+            }
+            logger.info(f"Добавлены координаты для локации {loc['name']} (ID: {loc['id']})")
+    
+    # НЕ сохраняем обратно, чтобы координаты не менялись при перезапуске
+    return coordinates
+
+def get_cached_map() -> Optional[str]:
+    """Получить кэшированную карту если она свежая"""
+    try:
+        cache_files = sorted(os.listdir(MAP_CACHE_DIR))
+        if not cache_files:
+            return None
+        
+        latest_map = f"{MAP_CACHE_DIR}{cache_files[-1]}"
+        file_time = os.path.getmtime(latest_map)
+        
+        if datetime.now().timestamp() - file_time < MAP_CACHE_TIME:
+            return latest_map
+    except:
+        pass
+    return None
+
+def cleanup_old_cache(max_files=5):
+    """Удалить старые кэшированные карты"""
+    try:
+        cache_files = sorted(os.listdir(MAP_CACHE_DIR))
+        if len(cache_files) > max_files:
+            for old_file in cache_files[:-max_files]:
+                try:
+                    os.remove(f"{MAP_CACHE_DIR}{old_file}")
+                    logger.debug(f"Удален старый кэш: {old_file}")
+                except:
+                    pass
+    except Exception as e:
+        logger.debug(f"Ошибка при очистке кэша: {e}")
+
+def cleanup_cache_completely():
+    """Полностью очистить кэш карт"""
+    try:
+        if os.path.exists(MAP_CACHE_DIR):
+            for filename in os.listdir(MAP_CACHE_DIR):
+                file_path = os.path.join(MAP_CACHE_DIR, filename)
+                try:
+                    if os.path.isfile(file_path):
+                        os.unlink(file_path)
+                except Exception as e:
+                    logger.debug(f"Ошибка при удалении файла {file_path}: {e}")
+        logger.info("✅ Кэш карт полностью очищен")
+    except Exception as e:
+        logger.error(f"Ошибка при полной очистке кэша: {e}")
+
+def load_font_with_fallback(font_size: int):
+    """Загрузить шрифт с поддержкой эмодзи"""
+    for font_path in FONT_PATHS:
+        try:
+            if os.path.exists(font_path):
+                font = ImageFont.truetype(font_path, font_size)
+                logger.debug(f"Загружен шрифт: {font_path}, размер: {font_size}")
+                return font
+        except Exception as e:
+            logger.debug(f"Не удалось загрузить шрифт {font_path}: {e}")
+    
+    # Если не нашли подходящий шрифт, используем стандартный
+    logger.warning(f"Не найден подходящий шрифт. Используем стандартный.")
+    return ImageFont.load_default(size=font_size)
+
+def generate_map_image(output_path: str, feedback_counts: Dict[int, Dict[str, int]]) -> bool:
+    """Сгенерировать карту с цветными числами"""
+    try:
+        coordinates = load_coordinates()
+        
+        # Пробуем открыть основную карту
+        try:
+            map_img = Image.open(MAP_IMAGE)
+            map_width, map_height = map_img.size
+            logger.info(f"Загружена карта: {MAP_IMAGE} ({map_width}x{map_height})")
+            
+            # Конвертируем в RGBA для поддержки прозрачности
+            if map_img.mode != 'RGBA':
+                map_img = map_img.convert('RGBA')
+                
+        except FileNotFoundError:
+            # Создаем простую заглушку
+            map_width, map_height = 1024, 1024
+            map_img = Image.new('RGBA', (map_width, map_height), color=(240, 240, 240, 255))
+            draw = ImageDraw.Draw(map_img)
+            
+            # Загружаем шрифт для заглушки
+            try:
+                font = load_font_with_fallback(36)
+            except:
+                font = ImageFont.load_default()
+            
+            draw.rectangle([50, 50, 974, 974], outline=(200, 200, 200), width=2)
+            
+            # Многострочный текст для заглушки
+            text_lines = [
+                "Карта школы",
+                "(загрузите school_map.png)",
+                "в папку images/"
+            ]
+            
+            # Рисуем каждую строку отдельно
+            for i, line in enumerate(text_lines):
+                draw.text(
+                    (map_width//2, map_height//2 - 40 + i*40),
+                    line,
+                    fill=(100, 100, 100),
+                    font=font,
+                    anchor='mm',
+                    align='center'
+                )
+            
+            logger.warning(f"Карта не найдена: {MAP_IMAGE}. Используется заглушка.")
+        
+        draw = ImageDraw.Draw(map_img)
+        
+        # Загружаем шрифты разных размеров (МЕНЬШИЙ ШРИФТ)
+        base_font_size = max(20, min(map_width, map_height) // 30)  # Уменьшили шрифт
+        font_large = load_font_with_fallback(base_font_size)
+        font_medium = load_font_with_fallback(base_font_size - 6)
+        
+        # Рисуем маркеры для каждой локации
+        markers_drawn = 0
+        for loc_id_str, coords in coordinates.items():
+            try:
+                loc_id = int(loc_id_str)
+            except ValueError:
+                continue
+                
+            counts = feedback_counts.get(loc_id, {"complaints": 0, "suggestions": 0})
+            
+            # Если нет обращений, пропускаем
+            if counts["complaints"] == 0 and counts["suggestions"] == 0:
+                continue
+            
+            # Координаты из файла (БЕЗ МАСШТАБИРОВАНИЯ)
+            x = coords.get("x", 512)
+            y = coords.get("y", 512)
+            
+            # Проверяем, чтобы координаты не выходили за пределы карты
+            x = max(50, min(x, map_width - 50))
+            y = max(50, min(y, map_height - 50))
+            
+            logger.debug(f"Локация {loc_id}: координаты ({x}, {y}), жалобы={counts['complaints']}, предложения={counts['suggestions']}")
+            
+            # Определяем, что будем рисовать
+            has_complaints = counts['complaints'] > 0
+            has_suggestions = counts['suggestions'] > 0
+            
+            if has_complaints and has_suggestions:
+                # И жалобы и предложения - рисуем два числа разных цветов
+                complaint_text = str(counts['complaints'])
+                suggestion_text = str(counts['suggestions'])
+                separator = "/"
+                
+                # Получаем размеры текста
+                try:
+                    complaint_bbox = draw.textbbox((0, 0), complaint_text, font=font_large)
+                    complaint_width = complaint_bbox[2] - complaint_bbox[0]
+                    complaint_height = complaint_bbox[3] - complaint_bbox[1]
+                    
+                    separator_bbox = draw.textbbox((0, 0), separator, font=font_large)
+                    separator_width = separator_bbox[2] - separator_bbox[0]
+                    separator_height = separator_bbox[3] - separator_bbox[1]
+                    
+                    suggestion_bbox = draw.textbbox((0, 0), suggestion_text, font=font_large)
+                    suggestion_width = suggestion_bbox[2] - suggestion_bbox[0]
+                    suggestion_height = suggestion_bbox[3] - suggestion_bbox[1]
+                except Exception as e:
+                    logger.warning(f"Ошибка при расчете размеров текста: {e}")
+                    # Приблизительные размеры
+                    complaint_width = len(complaint_text) * (font_large.size // 2)
+                    suggestion_width = len(suggestion_text) * (font_large.size // 2)
+                    complaint_height = suggestion_height = font_large.size
+                    separator_width = font_large.size // 4
+                
+                # Общая ширина
+                total_width = complaint_width + separator_width + suggestion_width
+                text_height = max(complaint_height, suggestion_height, separator_height)
+                
+                # Позиции для каждого элемента
+                complaint_x = x - total_width//2 + complaint_width//2
+                separator_x = complaint_x + complaint_width//2 + separator_width//2
+                suggestion_x = separator_x + separator_width//2 + suggestion_width//2
+                
+                # Рисуем фон
+                padding = max(10, min(map_width, map_height) // 50)  # Уменьшили отступы
+                rect_x1 = x - total_width//2 - padding
+                rect_y1 = y - text_height//2 - padding
+                rect_x2 = x + total_width//2 + padding
+                rect_y2 = y + text_height//2 + padding
+                
+                # Проверяем границы
+                if rect_x1 < 10:
+                    offset = abs(rect_x1) + 10
+                    rect_x1 += offset
+                    rect_x2 += offset
+                    complaint_x += offset
+                    separator_x += offset
+                    suggestion_x += offset
+                    x += offset
+                if rect_x2 > map_width - 10:
+                    offset = rect_x2 - map_width + 10
+                    rect_x1 -= offset
+                    rect_x2 -= offset
+                    complaint_x -= offset
+                    separator_x -= offset
+                    suggestion_x -= offset
+                    x -= offset
+                if rect_y1 < 10:
+                    offset = abs(rect_y1) + 10
+                    rect_y1 += offset
+                    rect_y2 += offset
+                    y += offset
+                if rect_y2 > map_height - 10:
+                    offset = rect_y2 - map_height + 10
+                    rect_y1 -= offset
+                    rect_y2 -= offset
+                    y -= offset
+                
+                # Полупрозрачный белый фон с черной рамкой
+                draw.rectangle(
+                    [rect_x1, rect_y1, rect_x2, rect_y2],
+                    fill=(255, 255, 255, 230),  # Полупрозрачный белый
+                    outline=(0, 0, 0, 255),  # Черная рамка
+                    width=1  # Тоньше рамка
+                )
+                
+                # Рисуем текст
+                try:
+                    # Жалобы (красный цвет)
+                    draw.text(
+                        (complaint_x, y),
+                        complaint_text,
+                        fill=(220, 0, 0, 255),  # Красный текст
+                        font=font_large,
+                        anchor='mm'
+                    )
+                    
+                    # Разделитель (черный)
+                    draw.text(
+                        (separator_x, y),
+                        separator,
+                        fill=(0, 0, 0, 255),  # Черный текст
+                        font=font_large,
+                        anchor='mm'
+                    )
+                    
+                    # Предложения (зеленый цвет)
+                    draw.text(
+                        (suggestion_x, y),
+                        suggestion_text,
+                        fill=(0, 180, 0, 255),  # Зеленый текст
+                        font=font_large,
+                        anchor='mm'
+                    )
+                except Exception as e:
+                    logger.warning(f"Ошибка при рисовании текста: {e}")
+                    # Альтернатива
+                    fallback_text = f"{counts['complaints']}/{counts['suggestions']}"
+                    draw.text(
+                        (x, y),
+                        fallback_text,
+                        fill=(0, 0, 0, 255),
+                        font=font_medium,
+                        anchor='mm'
+                    )
+                
+                display_text = f"{counts['complaints']}/{counts['suggestions']}"
+                
+            elif has_complaints:
+                # Только жалобы - рисуем красное число
+                complaint_text = str(counts['complaints'])
+                
+                # Получаем размеры текста
+                try:
+                    text_bbox = draw.textbbox((0, 0), complaint_text, font=font_large)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+                except:
+                    text_width = len(complaint_text) * (font_large.size // 2)
+                    text_height = font_large.size
+                
+                # Рисуем фон
+                padding = max(10, min(map_width, map_height) // 50)
+                rect_x1 = x - text_width//2 - padding
+                rect_y1 = y - text_height//2 - padding
+                rect_x2 = x + text_width//2 + padding
+                rect_y2 = y + text_height//2 + padding
+                
+                # Проверяем границы
+                if rect_x1 < 10:
+                    offset = abs(rect_x1) + 10
+                    rect_x1 += offset
+                    rect_x2 += offset
+                    x += offset
+                if rect_x2 > map_width - 10:
+                    offset = rect_x2 - map_width + 10
+                    rect_x1 -= offset
+                    rect_x2 -= offset
+                    x -= offset
+                if rect_y1 < 10:
+                    offset = abs(rect_y1) + 10
+                    rect_y1 += offset
+                    rect_y2 += offset
+                    y += offset
+                if rect_y2 > map_height - 10:
+                    offset = rect_y2 - map_height + 10
+                    rect_y1 -= offset
+                    rect_y2 -= offset
+                    y -= offset
+                
+                # Полупрозрачный белый фон с черной рамкой
+                draw.rectangle(
+                    [rect_x1, rect_y1, rect_x2, rect_y2],
+                    fill=(255, 255, 255, 230),
+                    outline=(0, 0, 0, 255),
+                    width=1
+                )
+                
+                # Рисуем текст (красный цвет для жалоб)
+                draw.text(
+                    (x, y),
+                    complaint_text,
+                    fill=(220, 0, 0, 255),  # Красный текст
+                    font=font_large,
+                    anchor='mm'
+                )
+                
+                display_text = f"{counts['complaints']}"
+                
+            elif has_suggestions:
+                # Только предложения - рисуем зеленое число
+                suggestion_text = str(counts['suggestions'])
+                
+                # Получаем размеры текста
+                try:
+                    text_bbox = draw.textbbox((0, 0), suggestion_text, font=font_large)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+                except:
+                    text_width = len(suggestion_text) * (font_large.size // 2)
+                    text_height = font_large.size
+                
+                # Рисуем фон
+                padding = max(10, min(map_width, map_height) // 50)
+                rect_x1 = x - text_width//2 - padding
+                rect_y1 = y - text_height//2 - padding
+                rect_x2 = x + text_width//2 + padding
+                rect_y2 = y + text_height//2 + padding
+                
+                # Проверяем границы
+                if rect_x1 < 10:
+                    offset = abs(rect_x1) + 10
+                    rect_x1 += offset
+                    rect_x2 += offset
+                    x += offset
+                if rect_x2 > map_width - 10:
+                    offset = rect_x2 - map_width + 10
+                    rect_x1 -= offset
+                    rect_x2 -= offset
+                    x -= offset
+                if rect_y1 < 10:
+                    offset = abs(rect_y1) + 10
+                    rect_y1 += offset
+                    rect_y2 += offset
+                    y += offset
+                if rect_y2 > map_height - 10:
+                    offset = rect_y2 - map_height + 10
+                    rect_y1 -= offset
+                    rect_y2 -= offset
+                    y -= offset
+                
+                # Полупрозрачный белый фон с черной рамкой
+                draw.rectangle(
+                    [rect_x1, rect_y1, rect_x2, rect_y2],
+                    fill=(255, 255, 255, 230),
+                    outline=(0, 0, 0, 255),
+                    width=1
+                )
+                
+                # Рисуем текст (зеленый цвет для предложений)
+                draw.text(
+                    (x, y),
+                    suggestion_text,
+                    fill=(0, 180, 0, 255),  # Зеленый текст
+                    font=font_large,
+                    anchor='mm'
+                )
+                
+                display_text = f"{counts['suggestions']}"
+            else:
+                continue
+            
+            markers_drawn += 1
+            logger.debug(f"Нарисован маркер для локации {loc_id} на координатах ({x}, {y}): {display_text}")
+        
+        # Сохраняем карту с высоким качеством
+        # Конвертируем RGBA в RGB перед сохранением как JPEG
+        if map_img.mode == 'RGBA':
+            map_img.convert('RGB').save(output_path, quality=95, optimize=True)
+        else:
+            # Если уже в режиме RGB, сохраняем как есть
+            map_img.save(output_path, quality=95, optimize=True)
+            
+        logger.info(f"✅ Сгенерирована новая карта: {output_path}. Маркеров: {markers_drawn}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при генерации карты: {e}", exc_info=True)
+        return False
+
+def generate_map_with_cache() -> str:
+    """Сгенерировать карту с кэшированием"""
+    # Всегда генерируем новую карту (отключаем кэш)
+    # cached_map = get_cached_map()
+    # if cached_map:
+    #     logger.info(f"Используем кэшированную карту: {cached_map}")
+    #     return cached_map
+    
+    # Генерируем новую карту
+    feedback_counts = get_feedback_counts()
+    
+    # Логируем статистику обращений
+    logger.info(f"Статистика обращений для карты: {feedback_counts}")
+    
+    # Создаем уникальное имя файла с временной меткой
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"{MAP_CACHE_DIR}map_{timestamp}.jpg"
+    
+    if generate_map_image(output_path, feedback_counts):
+        cleanup_old_cache()
+        return output_path
+    else:
+        # Если не удалось сгенерировать, возвращаем пустую строку
+        return ""
 
 # ==================== УТИЛИТЫ ДЛЯ ОТПРАВКИ СООБЩЕНИЙ ====================
 async def safe_edit_message(
@@ -242,6 +740,35 @@ async def safe_send_message(
         logger.error(f"Ошибка при отправке сообщения пользователю {chat_id}: {e}")
         return False
 
+async def safe_send_photo(
+    chat_id: int,
+    photo_path: str,
+    caption: str = "",
+    reply_markup: Optional[InlineKeyboardMarkup] = None
+) -> bool:
+    """Безопасная отправка фото"""
+    try:
+        if not os.path.exists(photo_path):
+            logger.error(f"Фото не найдено: {photo_path}")
+            return False
+        
+        # Используем FSInputFile для отправки файла
+        photo = FSInputFile(photo_path)
+        
+        # Отправляем фото с явным указанием parse_mode=None
+        # Это отключает HTML-парсинг для подписей
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode=None  # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: отключаем парсинг HTML
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при отправке фото: {e}")
+        return False
+
 # ==================== КЛАВИАТУРЫ ====================
 def get_main_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура главного меню"""
@@ -284,13 +811,10 @@ def get_locations_keyboard(feedback_type: str = None, view_only: bool = False) -
         
         # Формируем callback_data
         if view_only:
-            # Для просмотра обращений конкретной локации
             callback_data = f"view_loc_{loc['id']}"
         elif feedback_type:
-            # Для добавления обращения определенного типа
             callback_data = f"add_{feedback_type}_loc_{loc['id']}"
         else:
-            # Для общего просмотра (статистика + детали)
             callback_data = f"loc_details_{loc['id']}"
         
         buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
@@ -341,10 +865,8 @@ def get_pagination_keyboard(page: int, total_pages: int, location_id: int, feedb
     """Клавиатура пагинации для просмотра жалоб/предложений"""
     buttons = []
     
-    # Определяем префикс для callback_data
     prefix = "complaints" if feedback_type == "complaint" else "suggestions"
     
-    # Кнопки навигации
     nav_buttons = []
     if page > 1:
         nav_buttons.append(InlineKeyboardButton(
@@ -363,7 +885,6 @@ def get_pagination_keyboard(page: int, total_pages: int, location_id: int, feedb
     if nav_buttons:
         buttons.append(nav_buttons)
     
-    # Кнопка возврата
     buttons.append([InlineKeyboardButton(text="🔙 Назад к локации", callback_data=f"view_loc_{location_id}")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -381,7 +902,7 @@ async def cmd_start(message: Message):
 Здесь вы можете:
 • 📝 <b>Оставить жалобу</b> на проблему
 • 💡 <b>Предложить улучшение</b>
-• 📊 <b>Посмотреть существующие обращения</b>
+• 📊 <b>Посмотреть обращения</b> (с картой)
 
 <b>Конфиденциальность:</b>
 Все обращения анонимны. Ваши личные данные не отображаются другим пользователям.
@@ -408,7 +929,7 @@ async def cmd_help(message: Message):
 <b>Основные функции:</b>
 • <b>Оставить жалобу</b> - сообщить о проблеме
 • <b>Внести предложение</b> - предложить улучшение
-• <b>Посмотреть обращения</b> - просмотр жалоб и предложений
+• <b>Посмотреть обращения</b> - просмотр жалоб и предложений с картой
 
 <b>Конфиденциальность:</b>
 ✅ Все обращения <b>анонимны</b>
@@ -421,10 +942,11 @@ async def cmd_help(message: Message):
 3. Подробно опишите проблему или предложение
 4. Отправьте сообщение - ваше обращение будет сохранено
 
-<b>Условные обозначения:</b>
-🔴 - жалобы (проблемы, которые нужно решить)
-🟢 - предложения (идеи для улучшения)
-🏫🍽⚽ - эмодзи локаций
+<b>Карта обращений:</b>
+При просмотре обращений вы увидите карту школы с отметками:
+🔴X - количество жалоб по локации (красный эмодзи)
+🟢Y - количество предложений по локации (зеленый эмодзи)
+🔴X 🟢Y - и жалобы и предложения
 
 <b>Статистика в кнопках:</b>
 "🏫 Главный корпус (🔴3 🟢5)" означает:
@@ -463,10 +985,51 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "view_feedbacks")
 async def view_feedbacks(callback: CallbackQuery):
-    """Просмотр обращений по локациям"""
-    await safe_answer(callback)
+    """Просмотр обращений по локациям (сначала показываем карту)"""
+    await safe_answer(callback, text="🗺️ Генерируем актуальную карту...")
     
-    text = """
+    try:
+        # Загружаем координаты (создаем файл если его нет)
+        load_coordinates()
+        
+        # Генерируем карту (ВСЕГДА НОВУЮ)
+        map_path = generate_map_with_cache()
+        
+        if map_path and os.path.exists(map_path):
+            # Отправляем карту с обновленной подписью
+            map_caption = """🗺️ Карта обращений по школе
+
+Как читать карту:
+• 🟥 Красные числа — количество жалоб
+• 🟩 Зеленые числа — количество предложений
+• 🟥3/🟩5 — 3 жалобы и 5 предложений
+
+Примеры:
+• 5 — 5 жалоб (красный цвет)
+• 3 — 3 предложения (зеленый цвет)
+• 2/4 — 2 жалобы и 4 предложения
+
+Обновлено: {}
+""".format(datetime.now().strftime("%d.%m.%Y %H:%M"))
+            
+            success = await safe_send_photo(
+                chat_id=callback.message.chat.id,
+                photo_path=map_path,
+                caption=map_caption,
+            )
+            
+            if not success:
+                await callback.message.answer(
+                    "⚠️ Не удалось отправить карту. Возможно, файл поврежден.",
+                )
+        else:
+            # Если карта не сгенерирована, показываем текст
+            await callback.message.answer(
+                "⚠️ Карта школы пока не загружена. Пожалуйста, загрузите файл school_map.png в папку images/",
+            )
+        
+        # После карты показываем список локаций
+        text = """
 <b>📊 Просмотр обращений</b>
 
 Выберите локацию для просмотра жалоб и предложений:
@@ -482,12 +1045,16 @@ async def view_feedbacks(callback: CallbackQuery):
 
 Нажмите на локацию, чтобы увидеть детали.
 """
-    
-    await safe_edit_message(
-        callback=callback,
-        text=text,
-        reply_markup=get_locations_keyboard(view_only=True)
-    )
+        
+        await safe_send_message(
+            chat_id=callback.message.chat.id,
+            text=text,
+            reply_markup=get_locations_keyboard(view_only=True)
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка в view_feedbacks: {e}")
+        await safe_answer(callback, text="❌ Произошла ошибка при загрузке карты.", show_alert=True)
 
 @dp.callback_query(F.data.startswith("loc_details_"))
 async def location_details(callback: CallbackQuery):
@@ -569,7 +1136,6 @@ async def view_location_feedbacks(callback: CallbackQuery):
             )
             return
         
-        # Разделяем на жалобы и предложения
         complaints = [f for f in location_feedbacks if f["type"] == "complaint"]
         suggestions = [f for f in location_feedbacks if f["type"] == "suggestion"]
         
@@ -611,14 +1177,12 @@ async def view_location_feedbacks(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("view_complaints_loc_") | F.data.startswith("view_suggestions_loc_"))
 async def view_feedbacks_by_type(callback: CallbackQuery):
-    """Просмотр жалоб или предложений для локации с пагинацией"""
+    """Просмотр жалоб или предложений для локации с пагинацияцией"""
     await safe_answer(callback)
     
     try:
-        # Парсим callback_data: view_complaints_loc_1 или view_complaints_loc_1_page_1
         callback_data = callback.data
         
-        # Определяем тип обращений (жалобы или предложения)
         if "complaints" in callback_data:
             feedback_type = "complaint"
             prefix = "view_complaints_loc_"
@@ -626,16 +1190,11 @@ async def view_feedbacks_by_type(callback: CallbackQuery):
             feedback_type = "suggestion"
             prefix = "view_suggestions_loc_"
         
-        # Убираем префикс, чтобы получить остальные данные
         data_without_prefix = callback_data[len(prefix):]
-        
-        # Разбираем оставшиеся части
         parts = data_without_prefix.split('_')
         
-        # Первый элемент всегда location_id
         location_id = int(parts[0])
         
-        # Ищем номер страницы (если есть)
         page = 1
         for i in range(len(parts)):
             if parts[i] == "page" and i + 1 < len(parts):
@@ -648,7 +1207,6 @@ async def view_feedbacks_by_type(callback: CallbackQuery):
         location = get_location_full_info(location_id)
         feedbacks = get_feedbacks()
         
-        # Фильтруем обращения по типу и локации
         filtered_feedbacks = [
             f for f in feedbacks 
             if f["type"] == feedback_type and f["location_id"] == location_id
@@ -670,18 +1228,15 @@ async def view_feedbacks_by_type(callback: CallbackQuery):
             )
             return
         
-        # Настраиваем пагинацию
         items_per_page = 5
         total_items = len(filtered_feedbacks)
         total_pages = (total_items + items_per_page - 1) // items_per_page
         page = max(1, min(page, total_pages))
         
-        # Получаем данные для текущей страницы
         start_idx = (page - 1) * items_per_page
         end_idx = start_idx + items_per_page
         page_feedbacks = filtered_feedbacks[start_idx:end_idx]
         
-        # Формируем текст
         type_text = "жалоб" if feedback_type == "complaint" else "предложений"
         type_emoji = "🔴" if feedback_type == "complaint" else "🟢"
         
@@ -695,14 +1250,12 @@ async def view_feedbacks_by_type(callback: CallbackQuery):
 """
         
         for i, fb in enumerate(page_feedbacks, start=start_idx + 1):
-            # Анонимизируем текст
             safe_text = anonymize_text(fb['text'])
             text += f"""
 <b>{i}. {type_emoji} {fb['date']}</b>
 <b>Текст:</b> {safe_text}
 """
         
-        # Формируем клавиатуру с пагинацией
         await safe_edit_message(
             callback=callback,
             text=text,
@@ -737,6 +1290,10 @@ async def add_feedback_start(callback: CallbackQuery, state: FSMContext):
 <b>Конфиденциальность:</b>
 ✅ Ваше обращение будет полностью анонимным
 ✅ Другие пользователи не увидят ваши данные
+
+<b>Новые локации:</b>
+🎫 Турникеты - проблемы с доступом, картами, турникетами
+🏊 Бассейн - качество воды, температура, безопасность
 """
     
     await safe_edit_message(
@@ -752,7 +1309,7 @@ async def add_feedback_to_location(callback: CallbackQuery, state: FSMContext):
     
     try:
         parts = callback.data.split("_")
-        feedback_type = parts[1]  # complaint или suggestion
+        feedback_type = parts[1]
         location_id = int(parts[3])
         
         await state.update_data(
@@ -781,6 +1338,10 @@ async def add_feedback_to_location(callback: CallbackQuery, state: FSMContext):
 • Что именно можно улучшить
 • Как это можно реализовать
 • Какая будет польза
+
+<b>Примеры для новых локаций:</b>
+🎫 <b>Турникеты:</b> не срабатывает карта, медленная работа, застревание
+🏊 <b>Бассейн:</b> холодная вода, скользкий пол, не работает душ
 
 <b>Конфиденциальность:</b>
 ✅ Ваше обращение будет полностью анонимным
@@ -821,6 +1382,10 @@ async def add_feedback_type_only(callback: CallbackQuery, state: FSMContext):
 
 <b>Конфиденциальность:</b>
 ✅ Ваше обращение будет полностью анонимным
+
+<b>Новые локации:</b>
+🎫 Турникеты
+🏊 Бассейн
 """
     
     await safe_edit_message(
@@ -856,7 +1421,6 @@ async def enter_feedback_text(message: Message, state: FSMContext):
         feedback_type = state_data["feedback_type"]
         location_id = state_data["location_id"]
         
-        # Сохраняем обращение
         save_feedback(
             feedback_type=feedback_type,
             location_id=location_id,
@@ -865,12 +1429,10 @@ async def enter_feedback_text(message: Message, state: FSMContext):
             username=message.from_user.username
         )
         
-        # Получаем информацию для подтверждения
         location = get_location_full_info(location_id)
         type_text = "жалоба" if feedback_type == "complaint" else "предложение"
         type_emoji = "🔴" if feedback_type == "complaint" else "🟢"
         
-        # Отправляем подтверждение
         confirmation_text = f"""
 <b>✅ {type_emoji} {type_text.capitalize()} сохранена!</b>
 
@@ -895,10 +1457,8 @@ async def enter_feedback_text(message: Message, state: FSMContext):
             reply_markup=get_main_keyboard()
         )
         
-        # Очищаем состояние
         await state.clear()
         
-        # Отправляем уведомление администраторам (с реальными данными)
         await notify_admins_about_new_feedback(
             location_id=location_id,
             feedback_type=feedback_type,
@@ -977,7 +1537,6 @@ async def show_all_feedbacks(callback: CallbackQuery):
             )
             return
         
-        # Группируем по локациям
         locations = get_locations()
         location_map = {loc["id"]: f"{loc['emoji']} {loc['name']}" for loc in locations}
         
@@ -989,7 +1548,6 @@ async def show_all_feedbacks(callback: CallbackQuery):
 
 """
         
-        # Берем последние 10 обращений
         recent_feedbacks = sorted(filtered_feedbacks, key=lambda x: x.get("timestamp", ""), reverse=True)[:10]
         
         for fb in recent_feedbacks:
@@ -1002,7 +1560,6 @@ async def show_all_feedbacks(callback: CallbackQuery):
 <code>{safe_text}</code>
 """
         
-        # Добавляем статистику по локациям
         text += f"\n<b>📊 Статистика по локациям:</b>\n"
         
         feedback_counts = get_feedback_counts()
@@ -1102,7 +1659,6 @@ async def cmd_export(message: Message):
         return
     
     try:
-        # Создаем CSV файл с обращениями
         import csv
         from io import StringIO
         
@@ -1110,14 +1666,11 @@ async def cmd_export(message: Message):
         locations = get_locations()
         location_map = {loc["id"]: loc["name"] for loc in locations}
         
-        # Создаем CSV в памяти
         output = StringIO()
         writer = csv.writer(output, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
         
-        # Заголовки (админская версия с реальными данными)
         writer.writerow(["ID", "Дата", "Тип", "Локация", "Текст", "ID пользователя", "Username", "Публичный ID", "Статус"])
         
-        # Данные
         for fb in feedbacks:
             writer.writerow([
                 fb["id"],
@@ -1131,28 +1684,24 @@ async def cmd_export(message: Message):
                 fb.get("status", "новое")
             ])
         
-        # Создаем текстовый файл
         output.seek(0)
         csv_data = output.getvalue()
         
-        # Сохраняем во временный файл
         with open("data/export.csv", "w", encoding="utf-8") as f:
             f.write(csv_data)
         
-        # Отправляем файл
+        # Отправляем файл с простой подписью
         with open("data/export.csv", "rb") as f:
             await message.answer_document(
                 document=("feedbacks_export.csv", f),
-                caption=f"""
-📊 <b>Экспорт данных (Админ)</b>
+                caption=f"""📊 Экспорт данных (Админ)
 
-<b>Обращений:</b> {len(feedbacks)}
-<b>Дата экспорта:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
+Обращений: {len(feedbacks)}
+Дата экспорта: {datetime.now().strftime('%d.%m.%Y %H:%M')}
 
-<b>Примечание:</b>
+Примечание:
 • Содержит реальные данные пользователей
-• Для публичного просмотра используются анонимные ID
-"""
+• Для публичного просмотра используются анонимные ID"""
             )
             
     except Exception as e:
@@ -1187,17 +1736,47 @@ async def main():
     logger.info("🤖 Бот запускается...")
     logger.info(f"📊 Уровень логирования: {LOG_LEVEL}")
     logger.info(f"👑 Администраторы: {ADMIN_IDS}")
+    
+    # Загружаем координаты (создаем файл если его нет)
+    coordinates = load_coordinates()
+    logger.info(f"📁 Загружено координат локаций: {len(coordinates)}")
+    
+    locations = get_locations()
+    logger.info(f"📁 Загружено локаций: {len(locations)}")
+    
+    logger.info("📍 Список локаций:")
+    for loc in locations:
+        logger.info(f"  {loc['emoji']} {loc['name']} (ID: {loc['id']})")
+    
+    feedbacks = get_feedbacks()
+    logger.info(f"📁 Загружено обращений: {len(feedbacks)}")
+    
+    # Показываем статистику обращений
+    feedback_counts = get_feedback_counts()
+    logger.info("📊 Статистика обращений по локациям:")
+    for loc_id, counts in feedback_counts.items():
+        if counts["complaints"] > 0 or counts["suggestions"] > 0:
+            logger.info(f"  Локация {loc_id}: жалобы={counts['complaints']}, предложения={counts['suggestions']}")
+    
+    # Проверяем наличие карты
+    if os.path.exists(MAP_IMAGE):
+        try:
+            map_img = Image.open(MAP_IMAGE)
+            map_width, map_height = map_img.size
+            logger.info(f"🗺️ Карта найдена: {MAP_IMAGE} ({map_width}x{map_height})")
+            map_img.close()
+        except Exception as e:
+            logger.error(f"Ошибка при открытии карты: {e}")
+    else:
+        logger.warning(f"⚠️ Карта не найдена: {MAP_IMAGE}. Создайте файл или используйте заглушку.")
+    
+    # ОЧИЩАЕМ КЭШ ПРИ ЗАПУСКЕ БОТА
+    cleanup_cache_completely()
+    logger.info("✅ Кэш карт очищен при запуске")
+    
     logger.info("=" * 50)
     
     try:
-        # Инициализация данных
-        locations = get_locations()
-        feedbacks = get_feedbacks()
-        
-        logger.info(f"📁 Загружено локаций: {len(locations)}")
-        logger.info(f"📁 Загружено обращений: {len(feedbacks)}")
-        
-        # Запуск бота
         await dp.start_polling(bot, skip_updates=True)
         
     except Exception as e:
